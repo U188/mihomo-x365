@@ -154,3 +154,5 @@ replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20
 
 // Keep queued SMUX frames alive after a write is cancelled; see third_party/smux/README.mihomo.md.
 replace github.com/metacubex/smux => ./third_party/smux
+
+replace github.com/metacubex/sing-shadowsocks2 => github.com/llyufenggotest/sing-shadowsocks2-meta v0.0.0-20261015095155-3e1762193a22

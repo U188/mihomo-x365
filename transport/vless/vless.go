@@ -1,8 +1,9 @@
 package vless
 
 import (
+	"fmt"
 	"net"
-	"strings"
+	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
 
@@ -41,52 +42,63 @@ type DstAddr struct {
 	Mux      bool // currently used for XUDP only
 }
 
-// X365Marker is the uuid suffix that switches the connection to the private
-// "X365" wire format. It is not part of the uuid itself.
-const X365Marker = "#x365"
-
 // Client is vless connection generator
 type Client struct {
-	uuid   uuid.UUID
-	Addons *Addons
-	IsX365 bool // use the private X365 wire format
+	uuid       uuid.UUID
+	Addons     *Addons
+	IsX365     bool // ✨魔改新增
+	mode       PrivateMode
+	blackstone *blackstoneState
 }
 
 // StreamConn return a Conn with net.Conn and DstAddr
 func (c *Client) StreamConn(conn net.Conn, dst *DstAddr) (net.Conn, error) {
+	if c.mode == ModePure {
+		return c.dialPure(conn, dst)
+	}
 	return newConn(conn, c, dst)
 }
 
 func (c *Client) PacketConn(conn net.Conn, rAddr net.Addr) net.PacketConn {
+	if c.mode == ModePure {
+		return &purePacketReject{}
+	}
 	return &PacketConn{conn, rAddr}
 }
 
-// parseX365UUID strips the "#x365" marker from the uuid and reports whether it
-// was present. Without stripping, UUIDMap would fall back to a derived UUIDv5
-// of the whole string and authentication against the server would fail.
-func parseX365UUID(uuidStr string) (string, bool) {
-	if strings.HasSuffix(strings.ToLower(uuidStr), X365Marker) {
-		return uuidStr[:len(uuidStr)-len(X365Marker)], true
-	}
-	return uuidStr, false
-}
+type purePacketReject struct{}
 
-// IsX365UUID reports whether the uuid carries the private "#x365" marker so
-// adapter-level behavior (e.g. the endpoint-specific User-Agent) can match
-// the wire-format switch inside NewClient.
-func IsX365UUID(uuidStr string) bool {
-	_, ok := parseX365UUID(uuidStr)
-	return ok
+func (*purePacketReject) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, fmt.Errorf("Pure: UDP/XUDP unsupported")
 }
+func (*purePacketReject) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, fmt.Errorf("Pure: UDP/XUDP unsupported")
+}
+func (*purePacketReject) Close() error                     { return nil }
+func (*purePacketReject) LocalAddr() net.Addr              { return nil }
+func (*purePacketReject) SetDeadline(time.Time) error      { return nil }
+func (*purePacketReject) SetReadDeadline(time.Time) error  { return nil }
+func (*purePacketReject) SetWriteDeadline(time.Time) error { return nil }
 
 // NewClient return Client instance
-func NewClient(uuidStr string, addons *Addons) (*Client, error) {
-	cleanID, isX365 := parseX365UUID(uuidStr)
+func NewClient(uuidStr string, addons *Addons, isX365 bool) (*Client, error) { // ✨修复：这里加上了 isX365 bool
+	cleanID, mode, err := parsePrivateUUID(uuidStr)
+	if err != nil {
+		return nil, err
+	}
+	if mode == ModeBlackstone {
+		return nil, fmt.Errorf("Blackstone: explicit E/H configuration required; X365 cannot be combined")
+	}
+	if mode == ModeX365 {
+		isX365 = true
+	}
+	if mode == ModePure {
+		key, _, err := pureIdentity(uuidStr)
+		if err != nil {
+			return nil, err
+		}
+		return &Client{uuid: key, Addons: addons, mode: mode}, nil
+	}
 	uid := utils.UUIDMap(cleanID)
-
-	return &Client{
-		uuid:   uid,
-		Addons: addons,
-		IsX365: isX365,
-	}, nil
+	return &Client{uuid: uid, Addons: addons, IsX365: isX365, mode: mode}, nil
 }

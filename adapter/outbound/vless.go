@@ -13,6 +13,7 @@ import (
 	"github.com/metacubex/mihomo/common/convert"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
 	tlsC "github.com/metacubex/mihomo/component/tls"
@@ -36,13 +37,8 @@ import (
 	"github.com/samber/lo"
 )
 
-// x365UserAgent is the User-Agent the airport's X365 endpoint expects. Nodes
-// whose uuid carries the #x365 marker must present it, otherwise the server
-// rejects the xhttp request with "403 Forbidden".
 const x365UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-// prepareX365XHTTPHeaders injects the expected User-Agent for X365 nodes
-// unless the profile already provides one.
 func prepareX365XHTTPHeaders(headers map[string]string, x365 bool) map[string]string {
 	if !x365 {
 		return headers
@@ -78,14 +74,18 @@ type Vless struct {
 	restlsConfig    *restls.Config
 	jlsConfig       *jls.Config
 	realityConfig   *tlsC.RealityConfig
+	pure            bool
 }
 
 type VlessOption struct {
 	BasicOption
-	Name              string            `proxy:"name"`
-	Server            string            `proxy:"server"`
-	Port              int               `proxy:"port"`
-	UUID              string            `proxy:"uuid"`
+	Name   string `proxy:"name"`
+	Server string `proxy:"server"`
+	Port   int    `proxy:"port"`
+	UUID   string `proxy:"uuid"`
+	// E/H apply only to the exact UUID#blackstone private selector.
+	E                 bool              `proxy:"e,omitempty"`
+	H                 string            `proxy:"h,omitempty"`
 	Flow              string            `proxy:"flow,omitempty"`
 	TLS               bool              `proxy:"tls,omitempty"`
 	ALPN              []string          `proxy:"alpn,omitempty"`
@@ -231,6 +231,8 @@ func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 						ServerName:         serverName,
 						InsecureSkipVerify: v.option.SkipCertVerify,
 						NextProtos:         []string{"http/1.1"},
+						MinVersion:         lo.Ternary(v.pure, uint16(tls.VersionTLS13), uint16(0)),
+						MaxVersion:         lo.Ternary(v.pure, uint16(tls.VersionTLS13), uint16(0)),
 					},
 					Fingerprint:    v.option.Fingerprint,
 					NameCertVerify: v.option.NameCertVerify,
@@ -484,11 +486,50 @@ func parseVlessAddr(metadata *C.Metadata, xudp bool) *vless.DstAddr {
 	}
 }
 
+func configurePureVless(option *VlessOption) (bool, error) {
+	lower := strings.ToLower(option.UUID)
+	if !strings.Contains(lower, "#pure") {
+		return false, nil
+	}
+	if !strings.HasSuffix(lower, "#pure") {
+		return true, errors.New("Pure: invalid or mixed suffix")
+	}
+	if option.Flow != "" || (option.Encryption != "" && option.Encryption != "none") || option.UDP || option.PacketAddr || option.XUDP || option.PacketEncoding != "" {
+		return true, errors.New("Pure: flow, encryption, UDP/XUDP and packet encoding unsupported")
+	}
+	if !option.TLS || option.Network != "ws" {
+		return true, errors.New("Pure: requires TLS WebSocket transport")
+	}
+	if option.ClientFingerprint != "" || option.ECHOpts.Enable || option.RealityOpts.PublicKey != "" || option.ShadowTLSOpts.Password != "" || option.ShadowTLSOpts.Version != 0 || option.RestlsOpts.Password != "" || option.RestlsOpts.VersionHint != "" || option.RestlsOpts.RestlsScript != "" || option.JLSOpts.Username != "" || option.JLSOpts.Password != "" {
+		return true, errors.New("Pure: Reality, uTLS, ECH and alternate TLS engines unsupported")
+	}
+	if len(option.ALPN) > 0 && (len(option.ALPN) != 1 || option.ALPN[0] != "http/1.1") {
+		return true, errors.New("Pure: requires ALPN http/1.1")
+	}
+	if option.WSOpts.MaxEarlyData != 0 || option.WSOpts.EarlyDataHeaderName != "" || option.WSOpts.V2rayHttpUpgrade || option.WSOpts.V2rayHttpUpgradeFastOpen || len(option.WSOpts.Headers) != 0 || len(option.WSHeaders) != 0 || (option.WSOpts.Path != "" && option.WSOpts.Path != "/websocket") {
+		return true, errors.New("Pure: early data and custom WebSocket options unsupported")
+	}
+	option.ALPN = []string{"http/1.1"}
+	option.WSOpts.Path = "/websocket"
+	return true, nil
+}
+
 func NewVless(option VlessOption) (*Vless, error) {
-	// Detect the private marker here as well: the wire-format switch lives in
-	// transport/vless, but the xhttp request needs the endpoint-specific
-	// User-Agent derived from it.
-	isX365 := vless.IsX365UUID(option.UUID)
+	// Blackstone is an exact opt-in: legacy normalization must not repair its input.
+	trimmedUUID := strings.TrimSpace(option.UUID)
+	if strings.Contains(strings.ToLower(option.UUID), "#blackstone") && option.UUID != trimmedUUID {
+		return nil, errors.New("Blackstone: UUID selector must not contain surrounding whitespace")
+	}
+	// Preserve historical whitespace normalization for all existing modes.
+	option.UUID = trimmedUUID
+	pure, err := configurePureVless(&option)
+	if err != nil {
+		return nil, err
+	}
+
+	// All private VLESS markers are parsed once by the transport package so
+	// mixed suffixes cannot activate two wire modes.
+	isX365 := strings.HasSuffix(option.UUID, "#x365")
 	var addons *vless.Addons
 	if len(option.Flow) >= 16 {
 		option.Flow = option.Flow[:16]
@@ -505,7 +546,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 		option.PacketAddr = true
 		option.XUDP = false
 	default: // https://github.com/XTLS/Xray-core/pull/1567#issuecomment-1407305458
-		if !option.PacketAddr {
+		if !option.PacketAddr && !pure {
 			option.XUDP = true
 		}
 	}
@@ -513,7 +554,8 @@ func NewVless(option VlessOption) (*Vless, error) {
 		option.PacketAddr = false
 	}
 
-	client, err := vless.NewClient(option.UUID, addons)
+	// ⚠️ 注意：这里多传了一个 isX365
+	client, err := vless.NewClientWithBlackstoneOptions(option.UUID, addons, isX365, option.E, option.H)
 	if err != nil {
 		return nil, err
 	}
@@ -524,8 +566,8 @@ func NewVless(option VlessOption) (*Vless, error) {
 			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
 			Type:         C.Vless,
 			ProviderName: option.ProviderName,
-			UDP:          option.UDP,
-			XUDP:         option.XUDP,
+			UDP:          option.UDP && !pure,
+			XUDP:         option.XUDP && !pure,
 			TFO:          option.TFO,
 			MPTCP:        option.MPTCP,
 			Interface:    option.Interface,
@@ -534,6 +576,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 		}),
 		client: client,
 		option: &option,
+		pure:   pure,
 	}
 	v.dialer = option.NewDialer(v.DialOptions())
 

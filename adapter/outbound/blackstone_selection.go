@@ -1,0 +1,263 @@
+package outbound
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
+
+	"github.com/metacubex/mihomo/transport/blackstone"
+
+	"go.yaml.in/yaml/v3"
+)
+
+// deviceContext is immutable adapter input; response selection is local to each
+// parse/initialization flight, never cached on the adapter or process globally.
+func (h *XHttp) blackstoneDeviceContext() bool {
+	return h.option != nil && h.option.DeviceID != "" && h.option.DeviceName != ""
+}
+
+type blackstoneSelectionDocument struct {
+	Mode    string           `yaml:"mode"`
+	Rules   []string         `yaml:"rules"`
+	Proxies []map[string]any `yaml:"proxies"`
+	Groups  []map[string]any `yaml:"proxy-groups"`
+}
+
+// Decode through yaml.Node first: map decoding must not erase duplicate keys,
+// aliases, merge keys, or additional documents before contract validation.
+func blackstoneDecodeSelection(plain []byte) ([]map[string]any, error) {
+	dec := yaml.NewDecoder(strings.NewReader(string(plain)))
+	var root yaml.Node
+	if err := dec.Decode(&root); err != nil {
+		return nil, errors.New("invalid selection document")
+	}
+	var extra yaml.Node
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, errors.New("multiple selection documents")
+	}
+	if err := blackstoneValidateYAML(&root, 0); err != nil {
+		return nil, err
+	}
+	var doc blackstoneSelectionDocument
+	if err := root.Decode(&doc); err != nil {
+		return nil, errors.New("invalid selection fields")
+	}
+	if doc.Mode != "rule" || len(doc.Rules) == 0 {
+		return nil, errors.New("unproved selection mode or rules")
+	}
+	target := ""
+	for i, r := range doc.Rules {
+		parts := strings.Split(r, ",")
+		if strings.TrimSpace(parts[0]) != "MATCH" {
+			continue
+		}
+		if target != "" || i != len(doc.Rules)-1 || len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			return nil, errors.New("ambiguous final MATCH")
+		}
+		target = strings.TrimSpace(parts[1])
+	}
+	if target == "" || blackstoneReservedName(target) {
+		return nil, errors.New("missing final MATCH group")
+	}
+	leaves := make(map[string]map[string]any, len(doc.Proxies))
+	for _, p := range doc.Proxies {
+		n, ok := p["name"].(string)
+		if !ok || n == "" || blackstoneReservedName(n) || leaves[n] != nil {
+			return nil, errors.New("ambiguous leaf name")
+		}
+		leaves[n] = p
+	}
+	groups := make(map[string]map[string]any, len(doc.Groups))
+	for _, g := range doc.Groups {
+		n, ok := g["name"].(string)
+		if !ok || n == "" || blackstoneReservedName(n) || leaves[n] != nil || groups[n] != nil {
+			return nil, errors.New("ambiguous group name")
+		}
+		groups[n] = g
+	}
+	main := groups[target]
+	if main == nil || main["type"] != "url-test" {
+		return nil, errors.New("unproved main group")
+	}
+	for k, v := range main {
+		switch k {
+		case "name", "type", "proxies":
+		case "url":
+			if _, ok := v.(string); !ok {
+				return nil, errors.New("invalid health URL")
+			}
+		case "interval", "tolerance":
+			if !blackstoneBoundedInt(v, 86400) {
+				return nil, errors.New("invalid health option")
+			}
+		case "once-check":
+			// Official ARM64 OnceCheck (GroupOption+0xb8 -> URLTest+0x28)
+			// schedules Sleep(seconds), GroupBase.healthCheck; never expands members.
+			if !blackstoneBoundedInt(v, 86400) {
+				return nil, errors.New("invalid once-check")
+			}
+		case "lazy", "disable-udp":
+			if _, ok := v.(bool); !ok {
+				return nil, errors.New("invalid group boolean")
+			}
+		default:
+			return nil, errors.New("unproved main group option")
+		}
+	}
+	members, ok := main["proxies"].([]any)
+	if !ok || len(members) == 0 {
+		return nil, errors.New("empty main group")
+	}
+	selected := make([]map[string]any, 0, len(members))
+	seen := make(map[string]bool, len(members))
+	for _, v := range members {
+		n, ok := v.(string)
+		if !ok || n == "" || seen[n] || blackstoneReservedName(n) || groups[n] != nil || leaves[n] == nil {
+			return nil, errors.New("invalid exact main-group leaf")
+		}
+		seen[n] = true
+		selected = append(selected, leaves[n])
+	}
+	return selected, nil
+}
+func blackstoneBoundedInt(v any, max int) bool { n, ok := v.(int); return ok && n >= 0 && n <= max }
+func blackstoneReservedName(n string) bool {
+	switch strings.ToUpper(strings.TrimSpace(n)) {
+	case "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL":
+		return true
+	}
+	return false
+}
+func blackstoneValidateYAML(n *yaml.Node, depth int) error {
+	if depth > 64 || n.Kind == yaml.AliasNode || n.Anchor != "" {
+		return errors.New("unproved YAML indirection")
+	}
+	if n.Kind == yaml.MappingNode {
+		keys := make(map[string]bool, len(n.Content)/2)
+		for i := 0; i < len(n.Content); i += 2 {
+			key := n.Content[i]
+			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" || key.Value == "<<" || keys[key.Value] {
+				return errors.New("duplicate or invalid selection key")
+			}
+			keys[key.Value] = true
+		}
+	}
+	for _, c := range n.Content {
+		if err := blackstoneValidateYAML(c, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Reject malformed selected transports before any health race can silently
+// substitute a different member. Certificate payloads are validated after decrypt.
+func blackstoneValidateSelectedProxy(p map[string]any) error {
+	// Legacy "os" coercion is not evidence of device-contract capability.
+	if p["type"] == "vless" {
+		_, err := parseBlackstoneVless(p)
+		return err
+	}
+	if p["type"] != "xhttp" && p["type"] != "ss" {
+		return blackstoneSelectionCapability("unknown")
+	}
+	if p["type"] == "xhttp" {
+		if c, present := p["certificate"]; present {
+			if s, ok := c.(string); ok && s != "" {
+				return nil
+			}
+			return blackstoneSelectionCapability("certificate")
+		}
+	}
+	return blackstoneValidateTerminalProxy(p)
+}
+
+// Only outer wrappers may defer required fields to their decrypted payload.
+// Terminal objects cannot smuggle another certificate through that shortcut.
+func blackstoneValidateTerminalProxy(p map[string]any) error {
+	if _, present := p["certificate"]; present {
+		return blackstoneSelectionCapability("certificate")
+	}
+	for _, field := range []string{"server", "password"} {
+		if s, ok := p[field].(string); !ok || strings.TrimSpace(s) == "" {
+			return blackstoneSelectionCapability("fields")
+		}
+	}
+	port, err := strconv.Atoi(fmt.Sprint(p["port"]))
+	if err != nil || port < 1 || port > 65535 {
+		return blackstoneSelectionCapability("fields")
+	}
+	return nil
+}
+
+// Exact SS decoding must not coerce a malformed cipher into the default.
+func blackstoneSelectedSSConfig(p map[string]any) (xhttpRealConfig, error) {
+	var fields struct {
+		Name     string      `json:"name"`
+		Server   string      `json:"server"`
+		Port     json.Number `json:"port"`
+		Password string      `json:"password"`
+		Cipher   string      `json:"cipher"`
+		UDP      bool        `json:"udp"`
+		UOT      bool        `json:"udp-over-tcp"`
+		Version  int         `json:"udp-over-tcp-version"`
+	}
+	if cipher, present := p["cipher"]; present {
+		if _, ok := cipher.(string); !ok {
+			return xhttpRealConfig{}, blackstoneSelectionCapability("ss")
+		}
+	}
+	raw, err := json.Marshal(p)
+	if err != nil || json.Unmarshal(raw, &fields) != nil || fields.Version < 0 || fields.Version > 2 {
+		return xhttpRealConfig{}, blackstoneSelectionCapability("ss")
+	}
+	if fields.Cipher == "" {
+		fields.Cipher = "2022-blake3-aes-128-gcm"
+	}
+	return xhttpRealConfig{Name: fields.Name, Type: "ss", Server: fields.Server, Port: string(fields.Port), Password: fields.Password, Cipher: fields.Cipher, UDP: fields.UDP, UDPOverTCP: fields.UOT, UDPOverTCPVersion: fields.Version}, nil
+}
+
+// This is also the final exact-path delegate constructor. No plugins are enabled,
+// so construction/Close validate local capabilities without dialing any endpoint.
+func blackstoneSelectedSS(cfg xhttpRealConfig, basic BasicOption, name string) (*ShadowSocks, error) {
+	port, err := strconv.Atoi(cfg.Port)
+	if err != nil {
+		return nil, blackstoneSelectionCapability("ss")
+	}
+	ss, err := NewShadowSocks(ShadowSocksOption{BasicOption: basic, Name: name, Server: cfg.Server, Port: port, Password: cfg.Password + "#BLACKSTONE", Cipher: cfg.Cipher, UDP: cfg.UDP, UDPOverTCP: cfg.UDPOverTCP, UDPOverTCPVersion: cfg.UDPOverTCPVersion})
+	if err != nil {
+		// Do not attach constructor text: it contains endpoint and key details.
+		return nil, blackstoneSelectionCapability("ss")
+	}
+	return ss, nil
+}
+
+func blackstoneValidateSelectedConfig(cfg xhttpRealConfig) error {
+	switch cfg.Type {
+	case "ss":
+		ss, err := blackstoneSelectedSS(cfg, BasicOption{}, "capability-validation")
+		if err != nil {
+			return err
+		}
+		_ = ss.Close()
+	case "xhttp":
+		_, err := blackstone.New(blackstone.Config{Password: cfg.Password, Cipher: cfg.Cipher, TCPFake: cfg.TcpFake, UDPFake: cfg.UdpFake})
+		if err != nil {
+			return blackstoneSelectionCapability("xhttp")
+		}
+	case "vless":
+		if cfg.vlessOption == nil {
+			return blackstoneSelectionCapability("vless-fields")
+		}
+	default:
+		return blackstoneSelectionCapability("unknown")
+	}
+	return nil
+}
+
+func blackstoneSelectionCapability(typ string) error {
+	return blackstoneStageError("node-capability", fmt.Errorf("selected transport unsupported: %s", typ))
+}

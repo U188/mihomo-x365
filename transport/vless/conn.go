@@ -1,6 +1,9 @@
 package vless
 
 import (
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -16,12 +19,14 @@ import (
 
 type Conn struct {
 	N.ExtendedConn
-	dst      *DstAddr
-	id       uuid.UUID
-	addons   *Addons
-	received bool
-	sent     bool
-	isX365   bool // private "X365" wire mode
+	dst        *DstAddr
+	id         uuid.UUID
+	addons     *Addons
+	received   bool
+	sent       bool
+	isX365     bool // ✨新增
+	isJuzi     bool
+	blackstone *blackstoneState
 }
 
 func (vc *Conn) Read(b []byte) (int, error) {
@@ -69,12 +74,11 @@ func (vc *Conn) WriteBuffer(buffer *buf.Buffer) error {
 }
 
 func (vc *Conn) sendRequest(p []byte) (err error) {
+	// ✨ X365 魔改发包逻辑注入
 	if vc.isX365 {
-		// Private X365 wire format:
-		// "X365" 0x01 | command | uuid | [port | atyp | addr] | payload
 		requestLen := 5  // "X365" + 0x01
 		requestLen += 1  // command
-		requestLen += 16 // uuid
+		requestLen += 16 // UUID
 		if !vc.dst.Mux {
 			requestLen += 2 // port
 			requestLen += 1 // atyp
@@ -111,6 +115,7 @@ func (vc *Conn) sendRequest(p []byte) (err error) {
 		return
 	}
 
+	// 官方原版发包逻辑
 	var addonsBytes []byte
 	if vc.addons != nil {
 		addonsBytes, err = proto.Marshal(vc.addons)
@@ -119,10 +124,25 @@ func (vc *Conn) sendRequest(p []byte) (err error) {
 		}
 	}
 
+	// Capture one coherent current H at first write. Response updates on other
+	// streams may replace the per-client cache concurrently.
+	var privateHeader []byte
+	if vc.blackstone != nil {
+		if vc.blackstone.extension {
+			digest := md5.Sum(vc.id[:]) // protocol compatibility, not a security primitive
+			privateHeader = append(privateHeader, digest[:]...)
+		}
+		privateHeader = append(privateHeader, vc.blackstone.snapshot()...)
+	}
+
 	requestLen := 1  // protocol version
 	requestLen += 16 // UUID
-	requestLen += 1  // addons length
+	if vc.isJuzi {
+		requestLen += 8
+	}
+	requestLen += 1 // addons length
 	requestLen += len(addonsBytes)
+	requestLen += len(privateHeader)
 	requestLen += 1 // command
 	if !vc.dst.Mux {
 		requestLen += 2 // port
@@ -137,6 +157,14 @@ func (vc *Conn) sendRequest(p []byte) (err error) {
 	buf.Must(
 		buffer.WriteByte(Version),              // protocol version
 		buf.Error(buffer.Write(vc.id.Bytes())), // 16 bytes of uuid
+	)
+	if vc.isJuzi {
+		mac := hmac.New(sha256.New, []byte("hello_pidun"))
+		_, _ = mac.Write([]byte{Version})
+		_, _ = mac.Write(vc.id[:])
+		buf.Must(buf.Error(buffer.Write(mac.Sum(nil)[:8])))
+	}
+	buf.Must(
 		buffer.WriteByte(byte(len(addonsBytes))),
 		buf.Error(buffer.Write(addonsBytes)),
 	)
@@ -157,15 +185,19 @@ func (vc *Conn) sendRequest(p []byte) (err error) {
 		)
 	}
 
+	buf.Must(buf.Error(buffer.Write(privateHeader)))
 	buf.Must(buf.Error(buffer.Write(p)))
 
-	_, err = vc.ExtendedConn.Write(buffer.Bytes())
-	return
+	n, writeErr := vc.ExtendedConn.Write(buffer.Bytes())
+	if writeErr == nil && vc.blackstone != nil && n != buffer.Len() {
+		writeErr = io.ErrShortWrite
+	}
+	return writeErr
 }
 
 func (vc *Conn) recvResponse() (err error) {
 	if vc.isX365 {
-		// X365 handshake response: 5 bytes "X365" + 1 extra byte
+		// ✨ 新增：X365 握手返回验证
 		var header [5]byte
 		_, err = io.ReadFull(vc.ExtendedConn, header[:])
 		if err != nil {
@@ -177,6 +209,7 @@ func (vc *Conn) recvResponse() (err error) {
 		return nil
 	}
 
+	// 官方原版逻辑
 	var buffer [2]byte
 	_, err = io.ReadFull(vc.ExtendedConn, buffer[:])
 	if err != nil {
@@ -189,7 +222,24 @@ func (vc *Conn) recvResponse() (err error) {
 
 	length := int64(buffer[1])
 	if length != 0 { // addon data length > 0
-		io.CopyN(io.Discard, vc.ExtendedConn, length) // just discard
+		_, discardErr := io.CopyN(io.Discard, vc.ExtendedConn, length)
+		if vc.blackstone != nil && discardErr != nil {
+			return discardErr
+		}
+	}
+	if vc.blackstone != nil && len(vc.blackstone.snapshot()) != 0 {
+		var size [1]byte
+		if _, err := io.ReadFull(vc.ExtendedConn, size[:]); err != nil {
+			return err
+		}
+		if size[0] != 0 {
+			updated := make([]byte, 1+int(size[0]))
+			updated[0] = size[0]
+			if _, err := io.ReadFull(vc.ExtendedConn, updated[1:]); err != nil {
+				return err // never publish a partial response
+			}
+			vc.blackstone.replace(updated)
+		}
 	}
 
 	return
@@ -218,7 +268,9 @@ func newConn(conn net.Conn, client *Client, dst *DstAddr) (net.Conn, error) {
 		id:           client.uuid,
 		addons:       client.Addons,
 		dst:          dst,
-		isX365:       client.IsX365,
+		isX365:       client.IsX365, // ✨赋值
+		isJuzi:       client.mode == ModeJuzi,
+		blackstone:   client.blackstone,
 	}
 
 	if client.Addons != nil {

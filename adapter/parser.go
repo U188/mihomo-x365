@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/structure"
@@ -23,8 +24,9 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 	}
 
 	var (
-		proxy outbound.ProxyAdapter
-		err   error
+		proxy           outbound.ProxyAdapter
+		err             error
+		forcedFastupMux bool
 	)
 	switch proxyType {
 	case "ss":
@@ -83,6 +85,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewTrojan(*trojanOption)
+		if err == nil && outbound.IsFastupTrojanPassword(trojanOption.Password) {
+			proxy, err = outbound.NewSingMux(outbound.SingMuxOption{
+				Enabled:  true,
+				Protocol: "h2mux",
+			}, proxy)
+			forcedFastupMux = err == nil
+		}
 	case "hysteria":
 		hyOption := &outbound.HysteriaOption{BasicOption: basicOption}
 		err = decoder.Decode(mapping, hyOption)
@@ -174,6 +183,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewAnyTLS(*anytlsOption)
+	case "oppa":
+		oppaOption := &outbound.OppaOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, oppaOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewOppa(*oppaOption)
 	case "sudoku":
 		sudokuOption := &outbound.SudokuOption{BasicOption: basicOption}
 		err = decoder.Decode(mapping, sudokuOption)
@@ -223,6 +239,31 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewEasyTier(*easyTierOption)
+	case "Blackstone", "xhttp":
+		for _, key := range []string{"device_id", "device_name"} {
+			value, present := mapping[key]
+			if present {
+				text, ok := value.(string)
+				if !ok || strings.TrimSpace(text) == "" {
+					return nil, fmt.Errorf("Blackstone %s must be a non-empty string", key)
+				}
+			}
+		}
+		_, hasID := mapping["device_id"]
+		_, hasName := mapping["device_name"]
+		if hasID != hasName || (proxyType == "Blackstone" && !hasID) {
+			return nil, fmt.Errorf("Blackstone requires both device_id and device_name")
+		}
+		xhttpOption := &outbound.XHttpOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, xhttpOption)
+		if err != nil {
+			break
+		}
+		raw, err := outbound.NewXHttp(*xhttpOption)
+		if err != nil {
+			return nil, err
+		}
+		return outbound.NewXHttpProxyWrapper(NewProxy(raw), raw), nil
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}
@@ -231,7 +272,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		return nil, err
 	}
 
-	if muxMapping, muxExist := mapping["smux"].(map[string]any); muxExist {
+	if muxMapping, muxExist := mapping["smux"].(map[string]any); muxExist && !forcedFastupMux {
 		muxOption := &outbound.SingMuxOption{}
 		err = decoder.Decode(muxMapping, muxOption)
 		if err != nil {

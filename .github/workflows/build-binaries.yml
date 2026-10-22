@@ -19,6 +19,10 @@ permissions:
 
 env:
   VERSION: ${{ github.event.inputs.version || github.ref_name }}
+  # The ported private protocols depend on a fork module that is not in the
+  # public checksum database.
+  GOPRIVATE: github.com/llyufenggotest/*
+  GOFLAGS: -mod=mod
 
 jobs:
   build:
