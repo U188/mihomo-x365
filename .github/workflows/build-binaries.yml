@@ -52,7 +52,7 @@ jobs:
           EXT=""
           if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
           CGO_ENABLED=0 go build -tags with_gvisor -trimpath \
-            -ldflags "-X github.com/metacubex/mihomo/constant.Version=${VERSION} -X github.com/metacubex/mihomo/constant.BuildTime=$(date -u) -s -w" \
+            -ldflags "-X github.com/metacubex/mihomo/constant.Version=${VERSION} -X github.com/metacubex/mihomo/constant.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -s -w" \
             -o "mihomo-${VERSION}-${{ matrix.output }}${EXT}" .
 
       - name: Package
