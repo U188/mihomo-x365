@@ -36,6 +36,31 @@ import (
 	"github.com/samber/lo"
 )
 
+// x365UserAgent is the User-Agent the airport's X365 endpoint expects. Nodes
+// whose uuid carries the #x365 marker must present it, otherwise the server
+// rejects the xhttp request with "403 Forbidden".
+const x365UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+// prepareX365XHTTPHeaders injects the expected User-Agent for X365 nodes
+// unless the profile already provides one.
+func prepareX365XHTTPHeaders(headers map[string]string, x365 bool) map[string]string {
+	if !x365 {
+		return headers
+	}
+	prepared := make(map[string]string, len(headers)+1)
+	hasUserAgent := false
+	for key, value := range headers {
+		prepared[key] = value
+		if strings.EqualFold(key, "User-Agent") {
+			hasUserAgent = true
+		}
+	}
+	if !hasUserAgent {
+		prepared["User-Agent"] = x365UserAgent
+	}
+	return prepared
+}
+
 type Vless struct {
 	*Base
 	client *vless.Client
@@ -460,6 +485,10 @@ func parseVlessAddr(metadata *C.Metadata, xudp bool) *vless.DstAddr {
 }
 
 func NewVless(option VlessOption) (*Vless, error) {
+	// Detect the private marker here as well: the wire-format switch lives in
+	// transport/vless, but the xhttp request needs the endpoint-specific
+	// User-Agent derived from it.
+	isX365 := vless.IsX365UUID(option.UUID)
 	var addons *vless.Addons
 	if len(option.Flow) >= 16 {
 		option.Flow = option.Flow[:16]
@@ -642,7 +671,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 			Host:                 requestHost,
 			Path:                 v.option.XHTTPOpts.Path,
 			Mode:                 v.option.XHTTPOpts.Mode,
-			Headers:              v.option.XHTTPOpts.Headers,
+			Headers:              prepareX365XHTTPHeaders(v.option.XHTTPOpts.Headers, isX365),
 			NoGRPCHeader:         v.option.XHTTPOpts.NoGRPCHeader,
 			XPaddingBytes:        v.option.XHTTPOpts.XPaddingBytes,
 			XPaddingObfsMode:     v.option.XHTTPOpts.XPaddingObfsMode,

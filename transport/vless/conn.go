@@ -21,6 +21,7 @@ type Conn struct {
 	addons   *Addons
 	received bool
 	sent     bool
+	isX365   bool // private "X365" wire mode
 }
 
 func (vc *Conn) Read(b []byte) (int, error) {
@@ -68,6 +69,48 @@ func (vc *Conn) WriteBuffer(buffer *buf.Buffer) error {
 }
 
 func (vc *Conn) sendRequest(p []byte) (err error) {
+	if vc.isX365 {
+		// Private X365 wire format:
+		// "X365" 0x01 | command | uuid | [port | atyp | addr] | payload
+		requestLen := 5  // "X365" + 0x01
+		requestLen += 1  // command
+		requestLen += 16 // uuid
+		if !vc.dst.Mux {
+			requestLen += 2 // port
+			requestLen += 1 // atyp
+			requestLen += len(vc.dst.Addr)
+		}
+		requestLen += len(p)
+
+		buffer := buf.NewSize(requestLen)
+		defer buffer.Release()
+
+		buf.Must(buf.Error(buffer.Write([]byte{'X', '3', '6', '5', 0x01})))
+
+		if vc.dst.Mux {
+			buf.Must(buffer.WriteByte(CommandMux))
+		} else {
+			if vc.dst.UDP {
+				buf.Must(buffer.WriteByte(CommandUDP))
+			} else {
+				buf.Must(buffer.WriteByte(CommandTCP))
+			}
+		}
+
+		buf.Must(buf.Error(buffer.Write(vc.id.Bytes())))
+
+		if !vc.dst.Mux {
+			binary.BigEndian.PutUint16(buffer.Extend(2), vc.dst.Port)
+			buf.Must(
+				buffer.WriteByte(vc.dst.AddrType),
+				buf.Error(buffer.Write(vc.dst.Addr)),
+			)
+		}
+		buf.Must(buf.Error(buffer.Write(p)))
+		_, err = vc.ExtendedConn.Write(buffer.Bytes())
+		return
+	}
+
 	var addonsBytes []byte
 	if vc.addons != nil {
 		addonsBytes, err = proto.Marshal(vc.addons)
@@ -121,6 +164,19 @@ func (vc *Conn) sendRequest(p []byte) (err error) {
 }
 
 func (vc *Conn) recvResponse() (err error) {
+	if vc.isX365 {
+		// X365 handshake response: 5 bytes "X365" + 1 extra byte
+		var header [5]byte
+		_, err = io.ReadFull(vc.ExtendedConn, header[:])
+		if err != nil {
+			return err
+		}
+		if header[0] != 'X' || header[1] != '3' || header[2] != '6' || header[3] != '5' {
+			return errors.New("invalid x365 response header")
+		}
+		return nil
+	}
+
 	var buffer [2]byte
 	_, err = io.ReadFull(vc.ExtendedConn, buffer[:])
 	if err != nil {
@@ -162,6 +218,7 @@ func newConn(conn net.Conn, client *Client, dst *DstAddr) (net.Conn, error) {
 		id:           client.uuid,
 		addons:       client.Addons,
 		dst:          dst,
+		isX365:       client.IsX365,
 	}
 
 	if client.Addons != nil {
