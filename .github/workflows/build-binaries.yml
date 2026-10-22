@@ -32,12 +32,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { goos: windows, goarch: amd64, goamd64: v1, output: windows-amd64 }
-          - { goos: linux,   goarch: amd64, goamd64: v1, output: linux-amd64 }
-          - { goos: linux,   goarch: arm64,             output: linux-arm64 }
-          - { goos: android, goarch: arm64,             output: android-arm64 }
-          - { goos: darwin,  goarch: amd64,             output: darwin-amd64 }
-          - { goos: darwin,  goarch: arm64,             output: darwin-arm64 }
+          - { goos: windows, goarch: amd64, goamd64: v1, output: windows-amd64, tags: "with_gvisor" }
+          - { goos: linux,   goarch: amd64, goamd64: v1, output: linux-amd64,   tags: "with_gvisor with_ebpf" }
+          - { goos: linux,   goarch: arm64,             output: linux-arm64,     tags: "with_gvisor with_ebpf" }
+          - { goos: android, goarch: arm64,             output: android-arm64,   tags: "with_gvisor with_ebpf" }
+          - { goos: darwin,  goarch: amd64,             output: darwin-amd64,    tags: "with_gvisor" }
+          - { goos: darwin,  goarch: arm64,             output: darwin-arm64,    tags: "with_gvisor" }
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +55,7 @@ jobs:
         run: |
           EXT=""
           if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
-          CGO_ENABLED=0 go build -tags with_gvisor -trimpath \
+          CGO_ENABLED=0 go build -tags "${{ matrix.tags }}" -trimpath \
             -ldflags "-X github.com/metacubex/mihomo/constant.Version=${VERSION} -X github.com/metacubex/mihomo/constant.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -s -w" \
             -o "mihomo-${VERSION}-${{ matrix.output }}${EXT}" .
 
