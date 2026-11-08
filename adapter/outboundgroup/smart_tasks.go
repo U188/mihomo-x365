@@ -388,11 +388,13 @@ func runStalledSweep(ctx context.Context, interval, jitter time.Duration, backgr
 		// after it brings the sweep back.
 		uploaded := upload()
 		pending := false
-		if paused, _ := background(); !paused {
+		// Keep the change channel paired with the state that decides whether
+		// to scan, so a resume before the wait cannot be lost.
+		paused, changed := background()
+		if !paused {
 			pending = sweep()
 		}
 		for !pending {
-			paused, changed := background()
 			if paused {
 				uploaded = nil
 			}
@@ -406,6 +408,7 @@ func runStalledSweep(ctx context.Context, interval, jitter time.Duration, backgr
 					// Resumed: re-arm and look once more after the interval.
 					pending = true
 				}
+				paused, changed = background()
 			}
 		}
 		timer.Reset(interval)

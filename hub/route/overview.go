@@ -18,8 +18,8 @@ func overviewExitChain(mode tunnel.TunnelMode, rules []C.Rule, proxies map[strin
 	if mode == tunnel.Direct {
 		target = "DIRECT"
 	} else if mode == tunnel.Rule {
-		for index := len(rules) - 1; index >= 0; index-- {
-			rule := rules[index]
+		target = "DIRECT"
+		for _, rule := range rules {
 			if rule.RuleType() == C.MATCH {
 				target = rule.Adapter()
 				break

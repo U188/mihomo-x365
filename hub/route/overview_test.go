@@ -7,6 +7,7 @@ import (
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptest"
 	C "github.com/metacubex/mihomo/constant"
+	RC "github.com/metacubex/mihomo/rules/common"
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/stretchr/testify/assert"
 )
@@ -37,6 +38,29 @@ func TestOverviewExitDoesNotTouchProvidersOrSelectSmartNodes(t *testing.T) {
 	assert.Equal(t, overviewExit{Chain: []string{"DIRECT"}}, overviewExitChain(tunnel.Direct, nil, proxies))
 	selector.next = selector
 	assert.Equal(t, []string{"GLOBAL"}, overviewExitChain(tunnel.Global, nil, proxies).Chain)
+}
+
+func TestOverviewExitRuleOrderAndDefault(t *testing.T) {
+	proxies := map[string]C.Proxy{
+		"GLOBAL": &overviewProxy{name: "GLOBAL", kind: C.Selector},
+		"DIRECT": &overviewProxy{name: "DIRECT", kind: C.Direct},
+		"first":  &overviewProxy{name: "first", kind: C.Direct},
+		"last":   &overviewProxy{name: "last", kind: C.Direct},
+	}
+	for _, test := range []struct {
+		name  string
+		rules []C.Rule
+		want  string
+	}{
+		{name: "no rules", want: "DIRECT"},
+		{name: "no MATCH", rules: []C.Rule{RC.NewDomain("example.com", "first")}, want: "DIRECT"},
+		{name: "single MATCH", rules: []C.Rule{RC.NewMatch("first")}, want: "first"},
+		{name: "first MATCH wins", rules: []C.Rule{RC.NewMatch("first"), RC.NewMatch("last")}, want: "first"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, []string{test.want}, overviewExitChain(tunnel.Rule, test.rules, proxies).Chain)
+		})
+	}
 }
 
 func TestOverviewAuthentication(t *testing.T) {

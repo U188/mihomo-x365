@@ -512,3 +512,97 @@ func TestStalledSweepSleepsUntilUpload(t *testing.T) {
 		}
 	})
 }
+
+func TestStalledSweepDoesNotMissResumeBeforeWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		changed := make(chan struct{})
+		uploaded := make(chan struct{})
+		firstSnapshot := true
+		background := func() (bool, <-chan struct{}) {
+			if firstSnapshot {
+				firstSnapshot = false
+				pausedChange := changed
+				// Resume immediately after capturing the paused snapshot.
+				close(pausedChange)
+				changed = make(chan struct{})
+				return true, pausedChange
+			}
+			return false, changed
+		}
+		var sweeps atomic.Int32
+		go runStalledSweep(ctx, time.Second, 0, background, func() <-chan struct{} {
+			return uploaded
+		}, func() bool {
+			sweeps.Add(1)
+			return false
+		})
+
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 1 {
+			t.Fatalf("sweeps after resume without another upload = %d, want 1", got)
+		}
+	})
+}
+
+func TestStalledSweepPausesAndResumesWhileIdle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var mu sync.Mutex
+		paused := false
+		changed := make(chan struct{})
+		uploaded := make(chan struct{})
+		background := func() (bool, <-chan struct{}) {
+			mu.Lock()
+			defer mu.Unlock()
+			return paused, changed
+		}
+		setPaused := func(value bool) {
+			mu.Lock()
+			paused = value
+			close(changed)
+			changed = make(chan struct{})
+			mu.Unlock()
+			synctest.Wait()
+		}
+		var sweeps atomic.Int32
+		go runStalledSweep(ctx, time.Second, 0, background, func() <-chan struct{} {
+			mu.Lock()
+			defer mu.Unlock()
+			return uploaded
+		}, func() bool {
+			sweeps.Add(1)
+			return false
+		})
+
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 1 {
+			t.Fatalf("initial sweeps = %d, want 1", got)
+		}
+		setPaused(true)
+		mu.Lock()
+		close(uploaded)
+		uploaded = make(chan struct{})
+		mu.Unlock()
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 1 {
+			t.Fatalf("sweeps while paused = %d, want 1", got)
+		}
+		setPaused(false)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 2 {
+			t.Fatalf("sweeps after resume = %d, want 2", got)
+		}
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 2 {
+			t.Fatalf("resumed idle sweep kept waking: %d passes", got)
+		}
+	})
+}
